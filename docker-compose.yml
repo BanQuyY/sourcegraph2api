@@ -1,15 +1,109 @@
-version: '3.4'
+#!/bin/bash
 
-services:
-  sourcegraph2api:
-    image: deanxv/sourcegraph2api:latest
-    container_name: sourcegraph2api
-    restart: always
-    ports:
-      - "7033:7033"
-    volumes:
-      - ./data:/app/sourcegraph2api/data
-    environment:
-      - SG_COOKIE=******  # cookie (多个请以,分隔)
-      - API_SECRET=123456  # [可选]接口密钥-修改此行为请求头校验的值(多个请以,分隔)
-      - TZ=Asia/Shanghai
+# 设置要创建的项目数量为12
+PROJECT_COUNT=12
+
+# 获取当前账号的邮箱
+current_email=$(gcloud config get-value account)
+echo "当前账号的邮箱是: $current_email"
+
+# 项目前缀
+PROJECT_ID_PREFIX=${current_email%%@*}
+echo "生成的项目前缀为: $PROJECT_ID_PREFIX"
+
+# 存储项目ID的数组
+PROJECT_IDS=()
+
+# 检查已有项目
+EXISTING_PROJECTS=$(gcloud projects list --format="value(projectId)")
+
+# 如果存在项目,添加到数组中
+if [ ! -z "$EXISTING_PROJECTS" ]; then
+  for PROJECT_ID in $EXISTING_PROJECTS; do
+    PROJECT_IDS+=($PROJECT_ID)
+  done
+  echo "已将${#PROJECT_IDS[@]}个已有项目添加到数组中"
+else
+  echo "未发现已有项目"
+fi
+
+# 创建指定数量的项目
+for i in $(seq 1 $PROJECT_COUNT); do
+  PROJECT_ID="$PROJECT_ID_PREFIX-$i"
+  echo "正在创建项目: $PROJECT_ID"
+
+  # 创建新项目，不使用 --no-enable-billing 参数
+  gcloud projects create $PROJECT_ID --name="API Project $i" &
+  # 等待后台任务完成
+  wait
+  # 将项目ID添加到数组中
+  PROJECT_IDS+=($PROJECT_ID)
+  echo "项目 $PROJECT_ID 创建完成"
+done
+
+# 输出API密钥列表
+API_KEYS=""
+
+# 循环处理每个项目ID
+for PROJECT_ID in "${PROJECT_IDS[@]}"; do
+  echo "正在处理项目: $PROJECT_ID"
+
+  # 启用 Generative Language API
+  gcloud services enable generativelanguage.googleapis.com --project=$PROJECT_ID &
+  
+  # 生成新的API密钥
+  KEY_NAME="gl-api-key-$(date +%Y%m%d-%H%M%S)"
+  KEY_RESPONSE=$(gcloud beta services api-keys create \
+    --display-name="Generative Language API Key" \
+    --api-target=service=generativelanguage.googleapis.com \
+    --project=$PROJECT_ID \
+    --format="json" &)
+
+  # 等待所有后台任务完成
+  wait
+
+  # 检查返回结果中是否包含keyString
+  if echo "$KEY_RESPONSE" | grep -q "keyString"; then
+    # 直接从返回结果中提取keyString
+    API_KEY=$(echo "$KEY_RESPONSE" | grep -o '"keyString": "[^"]*' | cut -d'"' -f4)
+  else
+    # 如果返回结果中没有keyString,则使用原来的方式获取
+    echo "返回结果中没有keyString,使用备用方式获取"
+
+    # 获取新创建的API密钥
+    KEY_NAME=$(gcloud beta services api-keys list \
+      --project=$PROJECT_ID \
+      --filter="displayName:Generative Language API Key" \
+      --format="value(name)" \
+      --limit=1 &)
+
+    # 等待密钥列表返回
+    wait
+
+    # 获取API密钥字符串
+    API_KEY=$(gcloud beta services api-keys get-key-string $KEY_NAME \
+      --project=$PROJECT_ID \
+      --format="get(keyString)" &)
+  fi
+
+  # 等待 API 密钥获取完成
+  wait
+
+  # 添加到API密钥列表
+  API_KEYS="${API_KEYS}${API_KEY}\n"
+
+  echo "已在项目 $PROJECT_ID 中创建API密钥"
+done
+
+echo "密钥生成完成"
+
+# 获取当前用户邮箱并输出结果
+USER_EMAIL=$(gcloud config get-value account)
+KEY_COUNT=$(echo -e "$API_KEYS" | grep -c .)
+
+echo "API密钥列表(共${KEY_COUNT}个):"
+echo "$USER_EMAIL"
+echo -e "$API_KEYS"
+
+# 删除当前目录下的a.sh和b.sh文件
+rm -f a.sh b.sh
